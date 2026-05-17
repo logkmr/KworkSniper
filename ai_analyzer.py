@@ -68,6 +68,7 @@ async def get_rating(project: dict) -> Optional[str]:
     price = project.get("price", "—")
 
     user_prompt = (
+        f"{_SYSTEM_PROMPT}\n\n"
         f"Заголовок: {title}\n"
         f"Цена: {price} ₽\n"
         f"Описание: {description}"
@@ -76,7 +77,6 @@ async def get_rating(project: dict) -> Optional[str]:
     payload = {
         "model": AI_MODEL,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
@@ -119,6 +119,15 @@ async def get_rating(project: dict) -> Optional[str]:
                 _rating_cache[pid] = None
                 return None
 
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            body = exc.response.text if hasattr(exc, "response") else "no body"
+            logger.warning(
+                "[AI] API error for project %s (attempt %d/3): %s | body: %s",
+                pid, attempt, exc, body,
+            )
+            if attempt < 3:
+                await asyncio.sleep(15)
         except Exception as exc:
             last_exc = exc
             logger.warning("[AI] API error for project %s (attempt %d/3): %s", pid, attempt, exc)
