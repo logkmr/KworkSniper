@@ -1,5 +1,5 @@
 """
-AI анализатор заказов Kwork через Groq / OpenAI-compatible API.
+AI анализатор заказов Kwork через Gemini (OpenAI-compatible API).
 Кэширует оценки в памяти (одна оценка на заказ для всех пользователей).
 """
 import asyncio
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").rstrip("/")
 AI_TOKEN = os.getenv("AI_TOKEN", "")
-AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-120b")
+AI_MODEL = os.getenv("AI_MODEL", "gemini-3.1-flash-lite")
 
 _SYSTEM_PROMPT = (
     "Ты — фрилансер на Kwork, специализация: веб-разработка, программирование, IT. "
