@@ -2,6 +2,7 @@
 AI анализатор заказов Kwork через Groq / OpenAI-compatible API.
 Кэширует оценки в памяти (одна оценка на заказ для всех пользователей).
 """
+import asyncio
 import logging
 import os
 import re
@@ -82,44 +83,51 @@ async def get_rating(project: dict) -> Optional[str]:
         "max_tokens": 1000,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{AI_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {AI_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            logger.info("[AI] Full response for project %s: %s", pid, data)
-            choice = data.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content", "")
-            finish_reason = choice.get("finish_reason", "")
-            logger.info(
-                "[AI] Project %s | finish_reason=%s | content=%r",
-                pid, finish_reason, content,
-            )
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{AI_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {AI_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info("[AI] Full response for project %s: %s", pid, data)
+                choice = data.get("choices", [{}])[0]
+                content = choice.get("message", {}).get("content", "")
+                finish_reason = choice.get("finish_reason", "")
+                logger.info(
+                    "[AI] Project %s | finish_reason=%s | content=%r",
+                    pid, finish_reason, content,
+                )
 
-            match = re.search(r"Оценка:\s*(\d{1,2})/10", content)
-            if match:
-                score = int(match.group(1))
-                if 1 <= score <= 10:
-                    rating_text = f"{score}/10"
-                    _rating_cache[pid] = rating_text
-                    logger.info("[AI] Parsed rating for project %s: %s", pid, rating_text)
-                    return rating_text
+                match = re.search(r"Оценка:\s*(\d{1,2})/10", content)
+                if match:
+                    score = int(match.group(1))
+                    if 1 <= score <= 10:
+                        rating_text = f"{score}/10"
+                        _rating_cache[pid] = rating_text
+                        logger.info("[AI] Parsed rating for project %s: %s", pid, rating_text)
+                        return rating_text
 
-            logger.warning("[AI] Regex miss for project %s. Content: %r", pid, content)
-            _rating_cache[pid] = None
-            return None
+                logger.warning("[AI] Regex miss for project %s. Content: %r", pid, content)
+                _rating_cache[pid] = None
+                return None
 
-    except Exception as exc:
-        logger.warning("[AI] API error for project %s: %s", pid, exc)
-        _rating_cache[pid] = None
-        return None
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("[AI] API error for project %s (attempt %d/3): %s", pid, attempt, exc)
+            if attempt < 3:
+                await asyncio.sleep(15)
+
+    _rating_cache[pid] = None
+    logger.error("[AI] All attempts failed for project %s. Last error: %s", pid, last_exc)
+    return None
 
 
 def parse_score(rating_text: Optional[str]) -> Optional[int]:

@@ -64,9 +64,12 @@ async def toggle_notifications(user_id: int, enabled: bool) -> Optional[dict]:
             json={"notifications_enabled": enabled},
             headers={"Prefer": "return=representation"},
         )
-        if resp.status_code in (200, 204):
+        if resp.status_code == 200:
             data = resp.json()
             return data[0] if data else None
+        if resp.status_code == 204:
+            # 204 No Content — тело пустое, считаем что всё ок
+            return {"id": user_id, "notifications_enabled": enabled}
         return None
 
 
