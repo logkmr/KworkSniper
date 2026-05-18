@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 import ai_analyzer
 import database as db
 import parser
-from telegram_bot import router, get_cached_filters
+from telegram_bot import router, get_cached_filters, cache_projects
 
 load_dotenv()
 
@@ -75,6 +75,8 @@ async def run_parser(bot: Bot):
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
+                cache_projects(projects)
+
                 new_projects = []
                 for p in projects:
                     if p["id"] in seen_ids:
@@ -90,18 +92,19 @@ async def run_parser(bot: Bot):
                         len(new_projects),
                         len(users),
                     )
-                    for project in new_projects:
-                        keyboard = InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [
-                                    InlineKeyboardButton(
-                                        text="🔗 Открыть заказ",
-                                        url=project["url"],
-                                    )
-                                ]
-                            ]
-                        )
 
+                    base_keyboard = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="🔗 Открыть заказ",
+                                    url="",
+                                )
+                            ]
+                        ]
+                    )
+
+                    for project in new_projects:
                         # ─── Первый проход: собираем recipients ────────────
                         recipients = []
                         for user in users:
@@ -189,11 +192,39 @@ async def run_parser(bot: Bot):
                                     user["id"],
                                     ai_rating,
                                 )
+
+                            if user.get("auto_respond_enabled"):
+                                user_keyboard = InlineKeyboardMarkup(
+                                    inline_keyboard=[
+                                        [
+                                            InlineKeyboardButton(
+                                                text="🔗 Открыть заказ",
+                                                url=project["url"],
+                                            ),
+                                            InlineKeyboardButton(
+                                                text="🤖 Автоотклик",
+                                                callback_data=f"autorespond:{project['id']}",
+                                            ),
+                                        ]
+                                    ]
+                                )
+                            else:
+                                user_keyboard = InlineKeyboardMarkup(
+                                    inline_keyboard=[
+                                        [
+                                            InlineKeyboardButton(
+                                                text="🔗 Открыть заказ",
+                                                url=project["url"],
+                                            )
+                                        ]
+                                    ]
+                                )
+
                             try:
                                 await bot.send_message(
                                     chat_id=user["id"],
                                     text=text,
-                                    reply_markup=keyboard,
+                                    reply_markup=user_keyboard,
                                     disable_web_page_preview=True,
                                 )
                             except Exception as exc:

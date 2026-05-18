@@ -1,27 +1,17 @@
 """
 auto_responder.py
 
-Proof-of-Concept автоотклика на проекты Kwork.
+Утилиты для автоотклика на проекты Kwork:
+    1. Генерация текста + цены через LLM на основе профиля
+    2. Отправка отклика через API Kwork (POST /api/offer/createoffer)
 
-Логика:
-    1. При обнаружении проекта с AI-оценкой 9-10/10
-    2. ИИ генерирует текст отклика на основе профиля пользователя
-    3. Отправляет отклик через API Kwork (POST /api/offer/createoffer)
-
-Эндпоинты найдены через анализ JS want-worker + new-offer (18.05.2026):
+Эндпоинты (найдены через анализ JS want-worker + new-offer, 18.05.2026):
     - GET  /wants/{id}/check_offer_notify  — проверка перед откликом
     - POST /api/offer/createoffer          — создание отклика (FormData)
     - POST /api/offer/editoffer            — редактирование отклика
 
-Требования:
-    - Заполненный .env (AI_BASE_URL, AI_TOKEN, AI_MODEL)
-    - kwork_cookies.txt с cookies авторизованной сессии
-
-Использование (режим dry-run):
-    python auto_responder.py --dry-run --project-id 1234567
-
-Использование (реальный отклик):
-    python auto_responder.py --project-id 1234567
+Использование (CLI, dry-run):
+    python auto_responder.py --dry-run --project-id 1234567 --profile profile.json
 """
 
 import argparse
@@ -51,7 +41,6 @@ AI_MODEL = os.getenv("AI_MODEL", "google/gemini-3.1-flash-lite")
 
 BASE_URL = "https://kwork.ru"
 
-# Эндпоинты Kwork (найдены через анализ JS)
 OFFER_CREATE_ENDPOINT = "/api/offer/createoffer"
 OFFER_EDIT_ENDPOINT = "/api/offer/editoffer"
 CHECK_OFFER_NOTIFY_ENDPOINT = "/wants/{want_id}/check_offer_notify"
@@ -71,57 +60,62 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Профиль пользователя для персонализации откликов
+# Системный промпт: генерация текста отклика + расчёт цены
 # ---------------------------------------------------------------------------
-USER_PROFILE = {
-    "name": os.getenv("KWORK_USER_NAME", "Фрилансер"),
-    "specialization": os.getenv("KWORK_USER_SPEC", "Веб-разработчик, Python, Telegram-боты"),
-    "experience": os.getenv("KWORK_USER_EXP", "5 лет в веб-разработке, 3 года на Kwork"),
-    "skills": os.getenv("KWORK_USER_SKILLS", "Python, JavaScript, React, Node.js, PostgreSQL, Docker"),
-    "portfolio": os.getenv("KWORK_USER_PORTFOLIO", ""),
-    "strengths": os.getenv("KWORK_USER_STRENGTHS", "Быстрое выполнение, внимательность к деталям, всегда на связи"),
-    "rate": os.getenv("KWORK_USER_RATE", "2000 руб/час"),
-    "kwork_link": os.getenv("KWORK_USER_LINK", ""),
-}
 
-# ---------------------------------------------------------------------------
-# Трекинг отправленных откликов
-# ---------------------------------------------------------------------------
-SENT_OFFERS_FILE = "sent_offers.json"
-
-
-def load_sent_offers() -> set[str]:
-    if not os.path.exists(SENT_OFFERS_FILE):
-        return set()
-    try:
-        with open(SENT_OFFERS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except (json.JSONDecodeError, TypeError):
-        return set()
-
-
-def save_sent_offers(ids: set[str]) -> None:
-    with open(SENT_OFFERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(ids), f, ensure_ascii=False, indent=2)
-
+_RESPONSE_SYSTEM_PROMPT = (
+    "Ты — фрилансер на Kwork. Ты просматриваешь проект и должен написать "
+    "короткий, убедительный отклик (предложение) заказчику и предложить цену.\n\n"
+    "ПРАВИЛА РАСЧЁТА ЦЕНЫ:\n"
+    "- Проанализируй описание и оцени реальную сложность задачи\n"
+    "- Простая/быстрая задача (мелкий фикс, консультация, настройка) → снизь цену на 30-50% от бюджета\n"
+    "- Задача средней сложности (бот, лендинг, скрипт) → цена близка к бюджету (±10%)\n"
+    "- Сложная задача (полноценный сайт, интеграции, большой объём) → цена равна бюджету\n"
+    "- НИКОГДА не предлагай цену выше бюджета заказчика\n"
+    "- Цена должна быть целым числом в рублях\n\n"
+    "ПРАВИЛА ТЕКСТА:\n"
+    "- Пиши на русском языке\n"
+    "- Длина: 3-7 предложений (максимум 800 символов)\n"
+    "- Начни с персонализированного обращения к задаче заказчика (покажи, что прочитал описание)\n"
+    "- Кратко опиши свой релевантный опыт\n"
+    "- Предложи конкретные сроки (если возможно оценить)\n"
+    "- Закончи вопросом или призывом к действию (например, предложи обсудить детали)\n"
+    "- НЕ используй шаблонные фразы вроде 'Здравствуйте, я фрилансер с опытом...'\n"
+    "- НЕ пересказывай всё описание заказа — покажи, что ты понял суть\n"
+    "- Будь конкретным и профессиональным\n\n"
+    "ФОРМАТ ОТВЕТА (строго):\n"
+    "Цена: XXXX\n"
+    "\n"
+    "Текст отклика..."
+)
 
 # ---------------------------------------------------------------------------
 # Загрузка Cookies
 # ---------------------------------------------------------------------------
 
+def load_cookies_from_string(raw: str) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    cookies = {}
+    for pair in raw.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
 def load_cookies() -> dict[str, str]:
+    """Загружает куки из KWORK_COOKIE или kwork_cookies.txt."""
     raw = os.getenv("KWORK_COOKIE", "")
     if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            cookies = {}
-            for pair in raw.split(";"):
-                pair = pair.strip()
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    cookies[k.strip()] = v.strip()
-            return cookies
+        return load_cookies_from_string(raw)
 
     path = "kwork_cookies.txt"
     if not os.path.exists(path):
@@ -145,28 +139,17 @@ def get_csrf_token(cookies: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Генерация текста отклика через LLM
+# Генерация текста + цены через LLM
 # ---------------------------------------------------------------------------
 
-_RESPONSE_SYSTEM_PROMPT = (
-    "Ты — фрилансер на Kwork. Ты просматриваешь проект и должен написать "
-    "короткий, убедительный отклик (предложение) заказчику.\n\n"
-    "ПРАВИЛА:\n"
-    "- Пиши на русском языке\n"
-    "- Длина: 3-7 предложений (максимум 800 символов)\n"
-    "- Начни с персонализированного обращения к задаче заказчика (покажи, что прочитал описание)\n"
-    "- Кратко опиши свой релевантный опыт\n"
-    "- Предложи конкретные сроки (если возможно оценить)\n"
-    "- Закончи вопросом или призывом к действию (например, предложи обсудить детали)\n"
-    "- НЕ используй шаблонные фразы вроде 'Здравствуйте, я фрилансер с опытом...'\n"
-    "- НЕ предлагай цену ниже указанной в заказе\n"
-    "- НЕ пересказывай всё описание заказа — покажи, что ты понял суть\n"
-    "- Будь конкретным и профессиональным\n\n"
-    "Ответь ТОЛЬКО текстом отклика, без кавычек, без markdown, без 'Вот отклик:'."
-)
-
-
 async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
+    """
+    Генерирует текст отклика и цену через LLM.
+    Возвращает сырой ответ в формате:
+        Цена: XXXX
+
+        Текст отклика...
+    """
     if not AI_BASE_URL or not AI_TOKEN:
         logger.error("AI не настроен (AI_BASE_URL / AI_TOKEN)")
         return None
@@ -178,6 +161,7 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
 
     user_prompt = (
         f"Твой профиль на Kwork:\n"
+        f"- Имя: {profile.get('name', '')}\n"
         f"- Специализация: {profile.get('specialization', '')}\n"
         f"- Опыт: {profile.get('experience', '')}\n"
         f"- Навыки: {profile.get('skills', '')}\n"
@@ -230,6 +214,35 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
                 await asyncio.sleep(5)
 
     return None
+
+
+def parse_price_and_text(content: str, fallback_price: int) -> tuple[int, str]:
+    """
+    Парсит ответ ИИ формата:
+        Цена: XXXX
+
+        Текст отклика...
+
+    Возвращает (предложенная_цена, текст_отклика).
+    Если цену не удалось распарсить — используется fallback_price.
+    """
+    price = fallback_price
+    text = content
+
+    price_match = re.match(r'Цена:\s*(\d+)', content)
+    if price_match:
+        try:
+            parsed = int(price_match.group(1))
+            if parsed > 0:
+                price = parsed
+        except ValueError:
+            pass
+        text = content[price_match.end():].strip()
+
+    if not text:
+        text = content
+
+    return price, text
 
 
 # ---------------------------------------------------------------------------
@@ -288,18 +301,9 @@ async def send_offer(
     """
     Отправляет отклик на проект через Kwork API.
     Эндпоинт: POST /api/offer/createoffer (FormData)
-
-    Параметры FormData (из анализа JS setRequestDataOfferPage):
-        wantId          — ID проекта
-        offerType       — "custom" (своё предложение) или "kwork" (существующий кворк)
-        description     — текст сопроводительного письма
-        kwork_duration  — срок выполнения (в днях)
-        kwork_price     — цена предложения
-        kwork_name      — название предложения
     """
     url = f"{BASE_URL}{OFFER_CREATE_ENDPOINT}"
 
-    # Формируем FormData как в Kwork JS
     form = httpx.FormData({
         "wantId": want_id,
         "offerType": "custom",
@@ -362,26 +366,19 @@ async def send_offer(
         return False
 
 
-# ---------------------------------------------------------------------------
-# Основная функция
-# ---------------------------------------------------------------------------
-
-async def auto_respond(project_id: str, dry_run: bool = False) -> bool:
+async def send_offer_with_cookies(
+    cookie_text: str,
+    want_id: str,
+    description: str,
+    price: int,
+    duration: int = 1,
+) -> bool:
     """
-    Полный пайплайн автоотклика:
-    1. Проверяет, можно ли отправить отклик (check_offer_notify)
-    2. Загружает данные проекта
-    3. Генерирует текст через LLM
-    4. Отправляет (или симулирует в dry-run)
+    Отправляет отклик используя куки из строки (как получено от юзера).
     """
-    sent_offers = load_sent_offers()
-    if project_id in sent_offers:
-        logger.info("Проект %s — уже был отклик, пропускаю", project_id)
-        return False
-
-    cookies = load_cookies()
+    cookies = load_cookies_from_string(cookie_text)
     if not cookies:
-        logger.error("Нет cookies — отклик невозможен")
+        logger.error("Не удалось распарсить куки")
         return False
 
     csrf_token = get_csrf_token(cookies)
@@ -394,120 +391,110 @@ async def auto_respond(project_id: str, dry_run: bool = False) -> bool:
         follow_redirects=False,
         timeout=30,
     ) as client:
-        # Шаг 1: Проверка — можно ли отправить отклик
-        logger.info("=== Шаг 1: Проверка check_offer_notify ===")
-        check_data = await check_can_offer(client, project_id)
+        check_data = await check_can_offer(client, want_id)
         if not check_data or not check_data.get("success"):
-            logger.error("Нельзя отправить отклик на проект %s", project_id)
+            logger.error(
+                "Нельзя отправить отклик на проект %s: %s",
+                want_id,
+                json.dumps(check_data, ensure_ascii=False) if check_data else "no response",
+            )
             return False
 
-        # Шаг 2: Загружаем данные проекта
-        logger.info("=== Шаг 2: Загрузка проекта %s ===", project_id)
-        try:
-            resp = await client.get(f"{BASE_URL}/projects/{project_id}/view")
-            if resp.status_code != 200:
-                logger.error("Не удалось загрузить проект: HTTP %d", resp.status_code)
-                return False
-            html = resp.text
-        except Exception as e:
-            logger.error("Ошибка загрузки проекта: %s", e)
-            return False
-
-        # Извлекаем описание из embedded JSON
-        import parser as kwork_parser
-        wants = kwork_parser.extract_wants_json(html)
-        project_info = wants[0] if wants else {}
-
-        title = project_info.get("name", f"Проект {project_id}").strip()
-
-        price_limit = project_info.get("priceLimit", "—")
-        price_str = "—"
-        if price_limit:
-            try:
-                price_str = f"{float(price_limit):,.0f}".replace(",", " ")
-            except ValueError:
-                price_str = str(price_limit)
-
-        description = kwork_parser.clean_text(project_info.get("description") or "")
-
-        project = {
-            "id": project_id,
-            "title": title,
-            "price": price_str,
-            "description": description,
-            "category": "",
-        }
-
-        logger.info("Проект: %s | %s руб.", title, price_str)
-
-        # Шаг 3: Генерация текста отклика
-        logger.info("=== Шаг 3: Генерация текста отклика ===")
-        response_text = await generate_response_text(project, USER_PROFILE)
-        if not response_text:
-            logger.error("Не удалось сгенерировать текст отклика")
-            return False
-
-        logger.info("\n" + "=" * 60)
-        logger.info("ТЕКСТ ОТКЛИКА:")
-        logger.info(response_text)
-        logger.info("=" * 60)
-
-        if dry_run:
-            logger.info("[DRY RUN] Отклик НЕ отправлен (флаг --dry-run)")
-            return True
-
-        # Шаг 4: Отправка отклика
-        logger.info("=== Шаг 4: Отправка отклика ===")
-        price_value = None
-        try:
-            price_value = int(float(str(price_limit).replace(" ", "")))
-        except (ValueError, TypeError):
-            pass
-
-        success = await send_offer(
+        return await send_offer(
             client,
-            want_id=project_id,
-            description=response_text,
+            want_id=want_id,
+            description=description,
             csrf_token=csrf_token,
-            price=price_value,
-            duration=1,
+            price=price,
+            duration=duration,
             offer_name="",
         )
 
-        if success:
-            sent_offers.add(project_id)
-            save_sent_offers(sent_offers)
-            logger.info(">>> Сохранено в %s", SENT_OFFERS_FILE)
-
-        return success
-
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI (backwards compatible)
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Автоотклик Kwork — PoC")
+    parser = argparse.ArgumentParser(description="Автоотклик Kwork")
     parser.add_argument("--project-id", "-p", required=True, help="ID проекта на Kwork")
     parser.add_argument("--dry-run", "-d", action="store_true",
                         help="Сгенерировать текст, но НЕ отправлять отклик")
-    parser.add_argument("--profile", "-f",
+    parser.add_argument("--profile", "-f", required=True,
                         help="JSON-файл с профилем пользователя")
     args = parser.parse_args()
 
-    global USER_PROFILE
-    if args.profile:
-        with open(args.profile, "r", encoding="utf-8") as f:
-            USER_PROFILE = json.load(f)
-        logger.info("Профиль загружен из %s", args.profile)
+    with open(args.profile, "r", encoding="utf-8") as f:
+        profile = json.load(f)
+    logger.info("Профиль загружен из %s", args.profile)
 
-    success = asyncio.run(auto_respond(args.project_id, dry_run=args.dry_run))
+    async def _run():
+        import parser as kwork_parser
 
-    if success:
-        logger.info("Готово!")
-    else:
-        logger.error("Не удалось выполнить автоотклик")
-        sys.exit(1)
+        cookies = load_cookies()
+        if not cookies:
+            logger.error("Нет cookies — отклик невозможен")
+            sys.exit(1)
+
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            cookies=cookies,
+            follow_redirects=False,
+            timeout=30,
+        ) as client:
+            resp = await client.get(f"{BASE_URL}/projects/{args.project_id}/view")
+            if resp.status_code != 200:
+                logger.error("Не удалось загрузить проект: HTTP %d", resp.status_code)
+                sys.exit(1)
+            wants = kwork_parser.extract_wants_json(resp.text)
+            project_info = wants[0] if wants else {}
+            title = project_info.get("name", f"Проект {args.project_id}").strip()
+            description = kwork_parser.clean_text(project_info.get("description") or "")
+            price_limit = project_info.get("priceLimit", 0)
+
+            project = {
+                "id": args.project_id,
+                "title": title,
+                "price": str(price_limit),
+                "description": description,
+                "category": "",
+            }
+
+            raw_response = await generate_response_text(project, profile)
+            if not raw_response:
+                logger.error("Не удалось сгенерировать текст отклика")
+                sys.exit(1)
+
+            price_val = int(float(price_limit))
+            suggested_price, response_text = parse_price_and_text(raw_response, price_val)
+
+            logger.info("\n" + "=" * 60)
+            logger.info("ПРЕДЛОЖЕННАЯ ЦЕНА: %d руб.", suggested_price)
+            logger.info("ТЕКСТ ОТКЛИКА:")
+            logger.info(response_text)
+            logger.info("=" * 60)
+
+            if args.dry_run:
+                logger.info("[DRY RUN] Отклик НЕ отправлен")
+                return
+
+            csrf_token = get_csrf_token(cookies)
+            success = await send_offer(
+                client,
+                want_id=args.project_id,
+                description=response_text,
+                csrf_token=csrf_token,
+                price=suggested_price,
+                duration=1,
+                offer_name="",
+            )
+            if success:
+                logger.info("Готово!")
+            else:
+                logger.error("Не удалось отправить отклик")
+                sys.exit(1)
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

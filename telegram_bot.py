@@ -3,6 +3,7 @@ Telegram bot handlers for Kwork Sniper (aiogram 3.x).
 """
 
 import asyncio
+import time
 from typing import Optional
 
 from aiogram import Router, types, F
@@ -13,17 +14,108 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 import database as db
 import parser
+import auto_responder
 
 router = Router()
 
 # In-memory cache пользователей (user_id -> row dict)
 _user_cache: dict[int, dict] = {}
 
+# Кэш проектов для автоотклика (project_id -> project dict)
+_project_cache: dict[str, dict] = {}
+
+# Состояние предпросмотра автоотклика (user_id -> preview_data)
+_auto_state: dict[int, dict] = {}
+
+# Rate limit per user: {user_id: {"offers_this_hour": int, "hour_start": float, "last_offer_time": float}}
+_user_rate_limits: dict[int, dict] = {}
+
+AUTO_RESPOND_MAX_PER_HOUR = 2
+AUTO_RESPOND_MIN_INTERVAL = 360
+
+
+def cache_projects(projects: list[dict]) -> None:
+    for p in projects:
+        _project_cache[p["id"]] = p
+
+
+def _check_rate_limit(user_id: int) -> tuple[bool, str]:
+    now = time.time()
+    rl = _user_rate_limits.get(user_id)
+
+    if rl is None:
+        _user_rate_limits[user_id] = {
+            "offers_this_hour": 0,
+            "hour_start": now,
+            "last_offer_time": 0.0,
+        }
+        return True, ""
+
+    if now - rl["hour_start"] >= 3600:
+        rl["offers_this_hour"] = 0
+        rl["hour_start"] = now
+
+    if rl["offers_this_hour"] >= AUTO_RESPOND_MAX_PER_HOUR:
+        return False, f"Достигнут лимит откликов ({AUTO_RESPOND_MAX_PER_HOUR} в час). Попробуй позже."
+
+    if now - rl["last_offer_time"] < AUTO_RESPOND_MIN_INTERVAL:
+        remaining = int(AUTO_RESPOND_MIN_INTERVAL - (now - rl["last_offer_time"]))
+        return False, f"Слишком часто. Подожди ещё {remaining // 60} мин {remaining % 60} сек."
+
+    return True, ""
+
+
+def _mark_offer_sent(user_id: int) -> None:
+    now = time.time()
+    rl = _user_rate_limits.get(user_id)
+    if rl is None:
+        rl = {"offers_this_hour": 0, "hour_start": now, "last_offer_time": 0.0}
+        _user_rate_limits[user_id] = rl
+    rl["offers_this_hour"] += 1
+    rl["last_offer_time"] = now
+
+
+def _build_user_profile(user: dict) -> dict:
+    return {
+        "name": user.get("profile_name", ""),
+        "specialization": user.get("profile_spec", ""),
+        "experience": user.get("profile_exp", ""),
+        "skills": user.get("profile_skills", ""),
+        "portfolio": user.get("profile_portfolio", ""),
+        "strengths": user.get("profile_strengths", ""),
+        "rate": user.get("profile_rate", ""),
+    }
+
+
+def _has_profile(user: dict) -> bool:
+    return bool(
+        user.get("profile_name")
+        and user.get("profile_spec")
+        and user.get("profile_exp")
+    )
+
+
+def _has_cookies(user: dict) -> bool:
+    return bool(user.get("kwork_cookies", "").strip())
+
 
 class Form(StatesGroup):
     keywords = State()
     min_price = State()
     max_price = State()
+
+
+class AutoRespondForm(StatesGroup):
+    editing_text = State()
+    editing_price = State()
+    entering_profile_name = State()
+    entering_profile_spec = State()
+    entering_profile_exp = State()
+    entering_profile_skills = State()
+    entering_profile_portfolio = State()
+    entering_profile_strengths = State()
+    entering_profile_rate = State()
+    entering_cookies = State()
 
 
 async def _cache_get(user_id: int) -> dict | None:
@@ -64,6 +156,8 @@ async def _bg_patch(user_id: int, fields: dict):
             await db.set_ai_enabled(user_id, fields["ai_enabled"])
         elif "ai_min_score" in fields and len(fields) == 1:
             await db.set_ai_min_score(user_id, fields["ai_min_score"])
+        elif "auto_respond_enabled" in fields and len(fields) == 1:
+            await db.set_auto_respond_enabled(user_id, fields["auto_respond_enabled"])
         elif "min_price" in fields or "max_price" in fields:
             await db.set_price_range(
                 user_id,
@@ -76,6 +170,10 @@ async def _bg_patch(user_id: int, fields: dict):
                 fields.get("quiet_hours_start"),
                 fields.get("quiet_hours_end"),
             )
+        elif any(k.startswith("profile_") for k in fields):
+            await db.set_user_profile(user_id, **fields)
+        elif "kwork_cookies" in fields:
+            await db.set_user_cookies(user_id, fields["kwork_cookies"])
         else:
             for k, v in fields.items():
                 if k == "notifications_enabled":
@@ -88,6 +186,8 @@ async def _bg_patch(user_id: int, fields: dict):
                     await db.set_ai_enabled(user_id, v)
                 elif k == "ai_min_score":
                     await db.set_ai_min_score(user_id, v)
+                elif k == "auto_respond_enabled":
+                    await db.set_auto_respond_enabled(user_id, v)
                 elif k == "min_price":
                     await db.set_price_range(user_id, v, None)
                 elif k == "max_price":
@@ -96,6 +196,8 @@ async def _bg_patch(user_id: int, fields: dict):
                     await db.set_quiet_hours(user_id, v, None)
                 elif k == "quiet_hours_end":
                     await db.set_quiet_hours(user_id, None, v)
+                elif k.startswith("profile_") or k == "kwork_cookies":
+                    await _bg_patch(user_id, {k: v})
     except Exception:
         pass
 
@@ -133,6 +235,7 @@ def _notif_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="open_keywords")],
             [InlineKeyboardButton(text="💰 Диапазон цены", callback_data="open_price")],
             [InlineKeyboardButton(text="🌙 Тихий час", callback_data="open_quiet")],
+            [InlineKeyboardButton(text="⚡ Автоотклик", callback_data="open_autorespond")],
         ]
     )
 
@@ -154,6 +257,8 @@ def _filters_keyboard(user_filters: list[str]) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+# ─── Старт / нотификации ─────────────────────────────────────
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -263,6 +368,7 @@ async def cmd_status(message: types.Message):
     enabled = user.get("notifications_enabled", True)
     ai_enabled = user.get("ai_enabled", False)
     ai_min_score = user.get("ai_min_score")
+    ar_enabled = user.get("auto_respond_enabled", False)
     filters = user.get("filters", [])
     keywords = user.get("keywords", [])
     min_p = user.get("min_price")
@@ -273,6 +379,7 @@ async def cmd_status(message: types.Message):
     status_text = "✅ включены" if enabled else "❌ выключены"
     ai_min_text = f"мин. {ai_min_score}" if ai_min_score is not None else "без фильтра"
     ai_text = f"{'✅ включена' if ai_enabled else '❌ выключена'} ({ai_min_text})"
+    ar_text = "✅ включён" if ar_enabled else "❌ выключен"
     if filters:
         filter_names = [parser.CATEGORIES[s]["name"] for s in filters if s in parser.CATEGORIES]
         filters_text = ", ".join(filter_names)
@@ -296,6 +403,7 @@ async def cmd_status(message: types.Message):
         f"📊 <b>Статус</b>\n\n"
         f"Уведомления: {status_text}\n"
         f"AI-анализ: {ai_text}\n"
+        f"Автоотклик: {ar_text}\n"
         f"Категории: {filters_text}\n"
         f"Ключевые слова: {kw_text}\n"
         f"Цена: {price_text}\n"
@@ -785,3 +893,577 @@ async def cb_cancel_price(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Отменено")
     user = await _cache_get(callback.from_user.id)
     await _show_price_screen(callback, user)
+
+
+# ─── Автоотклик: экран ────────────────────────────────────────
+
+def _autorespond_keyboard(enabled: bool, has_profile: bool, has_cookies: bool) -> InlineKeyboardMarkup:
+    toggle = "✅ Автоотклик: включён" if enabled else "❌ Автоотклик: выключен"
+    prof = "📝 Профиль фрилансера" + (" ✅" if has_profile else " ⚠️")
+    cook = "🍪 Kwork куки" + (" ✅" if has_cookies else " ⚠️")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle, callback_data="autorespond:toggle")],
+            [InlineKeyboardButton(text=prof, callback_data="autorespond:profile")],
+            [InlineKeyboardButton(text=cook, callback_data="autorespond:cookies")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")],
+        ]
+    )
+
+
+async def _show_autorespond_screen(event: types.Message | CallbackQuery, user: dict | None):
+    enabled = user.get("auto_respond_enabled", False) if user else False
+    hp = _has_profile(user) if user else False
+    hc = _has_cookies(user) if user else False
+    markup = _autorespond_keyboard(enabled, hp, hc)
+    text = (
+        "⚡ <b>Автоотклик</b>\n\n"
+        "Бот сгенерирует текст и цену отклика на основе твоего профиля "
+        "и пришлёт на подтверждение перед отправкой.\n\n"
+        "⚠️ ВАЖНО:\n"
+        "- Не чаще 2 раз в час, не чаще раза в 6 минут\n"
+        "- Нужно заполнить профиль и Kwork куки\n"
+        "- Куки — ключ авторизации, никому не сообщай их"
+    )
+    if isinstance(event, types.Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "open_autorespond")
+async def cb_open_autorespond(callback: CallbackQuery):
+    await callback.answer()
+    user = await _cache_get(callback.from_user.id)
+    await _show_autorespond_screen(callback, user)
+
+
+@router.callback_query(F.data == "autorespond:toggle")
+async def cb_ar_toggle(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await _cache_get(user_id)
+    current = user.get("auto_respond_enabled", False) if user else False
+    new_state = not current
+    _cache_update(user_id, auto_respond_enabled=new_state)
+    await callback.answer("Автоотклик включён ⚡" if new_state else "Автоотклик выключен ❌")
+    user = await _cache_get(user_id)
+    await _show_autorespond_screen(callback, user)
+
+
+# ─── Автоотклик: профиль фрилансера ────────────────────────────
+
+_PROFILE_FIELDS = [
+    ("aprofile:name", "profile_name", "👤 Имя"),
+    ("aprofile:spec", "profile_spec", "🔧 Специализация"),
+    ("aprofile:exp", "profile_exp", "📅 Опыт"),
+    ("aprofile:skills", "profile_skills", "💻 Навыки"),
+    ("aprofile:portfolio", "profile_portfolio", "📁 Портфолио"),
+    ("aprofile:strengths", "profile_strengths", "💪 Сильные стороны"),
+    ("aprofile:rate", "profile_rate", "💰 Ставка"),
+]
+
+_PROFILE_FSM_MAP = {
+    "aprofile:name": AutoRespondForm.entering_profile_name,
+    "aprofile:spec": AutoRespondForm.entering_profile_spec,
+    "aprofile:exp": AutoRespondForm.entering_profile_exp,
+    "aprofile:skills": AutoRespondForm.entering_profile_skills,
+    "aprofile:portfolio": AutoRespondForm.entering_profile_portfolio,
+    "aprofile:strengths": AutoRespondForm.entering_profile_strengths,
+    "aprofile:rate": AutoRespondForm.entering_profile_rate,
+}
+
+
+def _profile_keyboard(user: dict | None) -> InlineKeyboardMarkup:
+    rows = []
+    for cb, key, label in _PROFILE_FIELDS:
+        val = user.get(key, "") if user else ""
+        display = val[:35] + "…" if len(val) > 35 else val
+        txt = f"{label}: {display}" if display else f"{label}: не задано"
+        rows.append([InlineKeyboardButton(text=txt, callback_data=cb)])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="open_autorespond")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "autorespond:profile")
+async def cb_ar_profile(callback: CallbackQuery):
+    await callback.answer()
+    user = await _cache_get(callback.from_user.id)
+    await callback.message.edit_text(
+        "📝 <b>Профиль фрилансера</b>\n\n"
+        "Заполни информацию о себе — на её основе ИИ пишет текст отклика.",
+        reply_markup=_profile_keyboard(user),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("aprofile:"))
+async def cb_aprofile_field(callback: CallbackQuery, state: FSMContext):
+    data = callback.data
+    user = await _cache_get(callback.from_user.id)
+    if user is None:
+        await callback.answer("Сначала нажми /start")
+        return
+
+    fsm_state = _PROFILE_FSM_MAP.get(data)
+    if fsm_state is None:
+        await callback.answer("Неизвестное поле")
+        return
+
+    field_info = next((f for f in _PROFILE_FIELDS if f[0] == data), None)
+    if field_info is None:
+        await callback.answer("Неизвестное поле")
+        return
+
+    _, key, label = field_info
+    current = user.get(key, "") or "не задано"
+
+    await state.set_state(fsm_state)
+    await callback.message.edit_text(
+        f"{label}\n\n"
+        f"Сейчас: {current}\n\n"
+        f"Отправь новое значение или «-» чтобы очистить:",
+        reply_markup=_input_cancel_keyboard(f"cancel:aprofile:{data}"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("cancel:aprofile:"))
+async def cb_cancel_aprofile(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Отменено")
+    user = await _cache_get(callback.from_user.id)
+    await callback.message.edit_text(
+        "📝 <b>Профиль фрилансера</b>\n\n"
+        "Заполни информацию о себе — на её основе ИИ пишет текст отклика.",
+        reply_markup=_profile_keyboard(user),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AutoRespondForm.entering_profile_name)
+async def process_profile_name(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_name")
+@router.message(AutoRespondForm.entering_profile_spec)
+async def process_profile_spec(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_spec")
+@router.message(AutoRespondForm.entering_profile_exp)
+async def process_profile_exp(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_exp")
+@router.message(AutoRespondForm.entering_profile_skills)
+async def process_profile_skills(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_skills")
+@router.message(AutoRespondForm.entering_profile_portfolio)
+async def process_profile_portfolio(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_portfolio")
+@router.message(AutoRespondForm.entering_profile_strengths)
+async def process_profile_strengths(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_strengths")
+@router.message(AutoRespondForm.entering_profile_rate)
+async def process_profile_rate(message: types.Message, state: FSMContext):
+    await _process_profile_field(message, state, "profile_rate")
+
+
+async def _process_profile_field(message: types.Message, state: FSMContext, field: str):
+    val = message.text.strip()
+    if val == "-":
+        val = ""
+    user_id = message.from_user.id
+    _cache_update(user_id, **{field: val})
+    await message.answer("Сохранено ✅")
+    await state.clear()
+    user = await _cache_get(user_id)
+    await message.answer(
+        "📝 <b>Профиль фрилансера</b>\n\n"
+        "Заполни информацию о себе — на её основе ИИ пишет текст отклика.",
+        reply_markup=_profile_keyboard(user),
+        parse_mode="HTML",
+    )
+
+
+# ─── Автоотклик: Kwork куки ────────────────────────────────────
+
+@router.callback_query(F.data == "autorespond:cookies")
+async def cb_ar_cookies(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user = await _cache_get(callback.from_user.id)
+    has = _has_cookies(user) if user else False
+    current = "заданы ✅" if has else "не заданы ⚠️"
+    await state.set_state(AutoRespondForm.entering_cookies)
+    await callback.message.edit_text(
+        "🍪 <b>Kwork куки</b>\n\n"
+        f"Сейчас: {current}\n\n"
+        "Отправь содержимое кук из браузера.\n"
+        "Формат: key1=value1; key2=value2; ...\n\n"
+        "⚠️ Куки — это доступ к твоему аккаунту. "
+        "Не отправляй их никому кроме этого бота.",
+        reply_markup=_input_cancel_keyboard("cancel:cookies"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "cancel:cookies")
+async def cb_cancel_cookies(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Отменено")
+    user = await _cache_get(callback.from_user.id)
+    await _show_autorespond_screen(callback, user)
+
+
+@router.message(AutoRespondForm.entering_cookies)
+async def process_cookies(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    raw = message.text.strip()
+    if raw == "-":
+        _cache_update(user_id, kwork_cookies="")
+        await message.answer("Куки очищены 🗑")
+    else:
+        _cache_update(user_id, kwork_cookies=raw)
+        await message.answer("Куки сохранены ✅\n\n⚠️ Исходное сообщение будет удалено через 5 секунд.")
+
+    await asyncio.sleep(5)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await state.clear()
+    user = await _cache_get(user_id)
+    await message.answer(
+        "⚡ <b>Автоотклик</b>\n\n"
+        "Бот сгенерирует текст и цену отклика на основе твоего профиля.",
+        reply_markup=_autorespond_keyboard(
+            user.get("auto_respond_enabled", False) if user else False,
+            _has_profile(user) if user else False,
+            _has_cookies(user) if user else False,
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ─── Автоотклик: генерация и предпросмотр ──────────────────────
+
+async def _show_respond_preview(
+    event: types.Message | CallbackQuery,
+    user_id: int,
+    project_id: str,
+    response_text: str,
+    suggested_price: int,
+):
+    project = _project_cache.get(project_id)
+    if not project:
+        if isinstance(event, CallbackQuery):
+            await event.answer("Проект не найден в кэше")
+        return
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"autoedit:text:{project_id}"),
+                InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"autoedit:price:{project_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"autoregen:{project_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="✅ Отправить", callback_data=f"autosend:{project_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="autocancel"),
+            ],
+        ]
+    )
+
+    title = project.get("title", "—")
+    budget = project.get("price", "—")
+
+    text = (
+        f"🤖 <b>Автоотклик</b>\n\n"
+        f"📋 <b>Заказ:</b> {title}\n"
+        f"💰 <b>Бюджет:</b> {budget} ₽\n"
+        f"💵 <b>Цена отклика:</b> {suggested_price} ₽\n\n"
+        f"<b>Текст отклика:</b>\n"
+        f"{response_text[:1500]}"
+    )
+
+    if isinstance(event, types.Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("autorespond:"))
+async def cb_autorespond_generate(callback: CallbackQuery):
+    parts = callback.data.split(":", 1)
+    project_id = parts[1] if len(parts) > 1 else None
+    if not project_id:
+        await callback.answer("Неверный ID проекта")
+        return
+
+    user_id = callback.from_user.id
+    user = await _cache_get(user_id)
+
+    if not _has_profile(user):
+        await callback.answer("Сначала заполни профиль фрилансера ⚠️")
+        return
+
+    project = _project_cache.get(project_id)
+    if not project:
+        await callback.answer("Проект устарел, попробуй позже")
+        return
+
+    await callback.answer("Генерирую отклик...")
+
+    profile = _build_user_profile(user)
+    raw = await auto_responder.generate_response_text(project, profile)
+    if not raw:
+        await callback.message.edit_text(
+            "❌ Не удалось сгенерировать отклик. Попробуй позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    budget_raw = project.get("price", "0")
+    budget_val = parser.extract_price_value(budget_raw) or 0
+    suggested_price, response_text = auto_responder.parse_price_and_text(raw, budget_val)
+
+    _auto_state[user_id] = {
+        "project_id": project_id,
+        "response_text": response_text,
+        "suggested_price": suggested_price,
+    }
+
+    await _show_respond_preview(callback, user_id, project_id, response_text, suggested_price)
+
+
+@router.callback_query(F.data.startswith("autoedit:text:"))
+async def cb_autoedit_text(callback: CallbackQuery, state: FSMContext):
+    project_id = callback.data.split(":", 2)[2]
+    user_id = callback.from_user.id
+    auto = _auto_state.get(user_id)
+    if not auto:
+        await callback.answer("Сессия истекла")
+        return
+
+    await state.set_state(AutoRespondForm.editing_text)
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование текста</b>\n\n"
+        f"Текущий текст:\n{auto['response_text'][:800]}\n\n"
+        f"Отправь новый текст или выбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"autoregen:{project_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="autoback")],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("autoedit:price:"))
+async def cb_autoedit_price(callback: CallbackQuery, state: FSMContext):
+    project_id = callback.data.split(":", 2)[2]
+    user_id = callback.from_user.id
+    auto = _auto_state.get(user_id)
+    if not auto:
+        await callback.answer("Сессия истекла")
+        return
+
+    await state.set_state(AutoRespondForm.editing_price)
+    await callback.message.edit_text(
+        f"💰 <b>Редактирование цены</b>\n\n"
+        f"Текущая цена: {auto['suggested_price']} ₽\n\n"
+        f"Отправь новую цену (целое число) или нажми Назад:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="autoback")],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("autoregen:"))
+async def cb_autoregen(callback: CallbackQuery, state: FSMContext):
+    project_id = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    user = await _cache_get(user_id)
+    project = _project_cache.get(project_id)
+
+    if not project:
+        await callback.answer("Проект устарел")
+        return
+
+    await callback.answer("Перегенерирую...")
+    await state.clear()
+
+    profile = _build_user_profile(user)
+    raw = await auto_responder.generate_response_text(project, profile)
+    if not raw:
+        await callback.message.edit_text(
+            "❌ Не удалось перегенерировать отклик.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    budget_raw = project.get("price", "0")
+    budget_val = parser.extract_price_value(budget_raw) or 0
+    suggested_price, response_text = auto_responder.parse_price_and_text(raw, budget_val)
+
+    _auto_state[user_id] = {
+        "project_id": project_id,
+        "response_text": response_text,
+        "suggested_price": suggested_price,
+    }
+
+    await _show_respond_preview(callback, user_id, project_id, response_text, suggested_price)
+
+
+@router.callback_query(F.data == "autoback")
+async def cb_autoback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    user_id = callback.from_user.id
+    auto = _auto_state.get(user_id)
+    if not auto:
+        await callback.message.edit_text(
+            "Сессия истекла.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+    await _show_respond_preview(
+        callback, user_id, auto["project_id"],
+        auto["response_text"], auto["suggested_price"],
+    )
+
+
+@router.message(AutoRespondForm.editing_text)
+async def process_editing_text(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    new_text = message.text.strip()
+    if not new_text:
+        await message.answer("Текст не может быть пустым.")
+        return
+
+    auto = _auto_state.get(user_id)
+    if not auto:
+        await message.answer("Сессия истекла.")
+        await state.clear()
+        return
+
+    auto["response_text"] = new_text
+    await state.clear()
+    await _show_respond_preview(
+        message, user_id, auto["project_id"],
+        auto["response_text"], auto["suggested_price"],
+    )
+
+
+@router.message(AutoRespondForm.editing_price)
+async def process_editing_price(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    raw = message.text.strip()
+    try:
+        new_price = int(raw)
+        if new_price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введи целое положительное число.")
+        return
+
+    auto = _auto_state.get(user_id)
+    if not auto:
+        await message.answer("Сессия истекла.")
+        await state.clear()
+        return
+
+    auto["suggested_price"] = new_price
+    await state.clear()
+    await _show_respond_preview(
+        message, user_id, auto["project_id"],
+        auto["response_text"], auto["suggested_price"],
+    )
+
+
+@router.callback_query(F.data.startswith("autosend:"))
+async def cb_autosend(callback: CallbackQuery, state: FSMContext):
+    project_id = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    user = await _cache_get(user_id)
+    auto = _auto_state.get(user_id)
+
+    if not auto:
+        await callback.answer("Сессия истекла")
+        return
+
+    if not _has_cookies(user):
+        await callback.answer("Сначала добавь Kwork куки ⚠️")
+        return
+
+    ok, err_msg = _check_rate_limit(user_id)
+    if not ok:
+        await callback.answer(err_msg)
+        return
+
+    sent_ids = await db.get_sent_offer_ids(user_id)
+    if project_id in sent_ids:
+        await callback.answer("Ты уже откликался на этот заказ")
+        return
+
+    await callback.answer("Отправляю отклик...")
+    await state.clear()
+
+    success = await auto_responder.send_offer_with_cookies(
+        user.get("kwork_cookies", ""),
+        project_id,
+        auto["response_text"],
+        auto["suggested_price"],
+    )
+
+    if success:
+        _mark_offer_sent(user_id)
+        await db.add_sent_offer_id(user_id, project_id)
+        _auto_state.pop(user_id, None)
+
+        project = _project_cache.get(project_id, {})
+        await callback.message.edit_text(
+            f"✅ <b>Отклик отправлен!</b>\n\n"
+            f"📋 {project.get('title', '—')}\n"
+            f"💵 Цена: {auto['suggested_price']} ₽\n"
+            f"🔗 <a href='{project.get('url', '')}'>Открыть заказ</a>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")],
+            ]),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ <b>Не удалось отправить отклик.</b>\n\n"
+            "Возможные причины:\n"
+            "- Куки истекли — обнови их\n"
+            "- Проект уже не принимает отклики\n"
+            "- Ошибка на стороне Kwork",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"autosend:{project_id}")],
+                [InlineKeyboardButton(text="❌ Закрыть", callback_data="autocancel")],
+            ]),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data == "autocancel")
+async def cb_autocancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    _auto_state.pop(user_id, None)
+    await callback.answer("Отменено")
+    await callback.message.edit_text(
+        "🚫 Автоотклик отменён.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")],
+        ]),
+        parse_mode="HTML",
+    )

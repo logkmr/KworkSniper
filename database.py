@@ -68,7 +68,6 @@ async def toggle_notifications(user_id: int, enabled: bool) -> Optional[dict]:
             data = resp.json()
             return data[0] if data else None
         if resp.status_code == 204:
-            # 204 No Content — тело пустое, считаем что всё ок
             return {"id": user_id, "notifications_enabled": enabled}
         return None
 
@@ -87,9 +86,7 @@ async def get_subscribed_users() -> list[dict]:
 # ─── Filters ──────────────────────────────────────────────────
 
 async def get_user_filters(user_id: int) -> list[str]:
-    """Возвращает список ВКЛЮЧЕННЫХ category_slug для пользователя.
-    Пустой список означает 'ничего не выбрано, не присылать'.
-    """
+    """Возвращает список ВКЛЮЧЕННЫХ category_slug для пользователя."""
     user = await get_user(user_id)
     if not user:
         return []
@@ -174,6 +171,77 @@ async def set_ai_min_score(user_id: int, score: Optional[int]) -> bool:
         resp = await client.patch(
             f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
             json={"ai_min_score": score},
+            headers={"Prefer": "return=minimal"},
+        )
+        return resp.status_code in (200, 204)
+
+
+# ─── Auto-respond ─────────────────────────────────────────────
+
+async def set_auto_respond_enabled(user_id: int, enabled: bool) -> bool:
+    async with _client() as client:
+        resp = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
+            json={"auto_respond_enabled": enabled},
+            headers={"Prefer": "return=minimal"},
+        )
+        return resp.status_code in (200, 204)
+
+
+async def set_user_profile(user_id: int, **fields) -> bool:
+    allowed = {
+        "profile_name", "profile_spec", "profile_exp",
+        "profile_skills", "profile_portfolio", "profile_strengths",
+        "profile_rate",
+    }
+    payload = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not payload:
+        return False
+    async with _client() as client:
+        resp = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
+            json=payload,
+            headers={"Prefer": "return=minimal"},
+        )
+        return resp.status_code in (200, 204)
+
+
+async def set_user_cookies(user_id: int, cookies: str) -> bool:
+    async with _client() as client:
+        resp = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
+            json={"kwork_cookies": cookies},
+            headers={"Prefer": "return=minimal"},
+        )
+        return resp.status_code in (200, 204)
+
+
+async def get_sent_offer_ids(user_id: int) -> list[str]:
+    user = await get_user(user_id)
+    if not user:
+        return []
+    raw = user.get("auto_respond_sent_ids")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+async def add_sent_offer_id(user_id: int, want_id: str) -> bool:
+    current = await get_sent_offer_ids(user_id)
+    if want_id in current:
+        return True
+    current.append(want_id)
+    async with _client() as client:
+        resp = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
+            json={"auto_respond_sent_ids": current},
             headers={"Prefer": "return=minimal"},
         )
         return resp.status_code in (200, 204)
