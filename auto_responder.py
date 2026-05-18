@@ -189,7 +189,7 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.8,
-        "max_tokens": 2000,
+        "max_tokens": 8000,
     }
 
     logger.info("Генерирую текст отклика через %s...", AI_MODEL)

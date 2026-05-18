@@ -80,7 +80,7 @@ async def get_rating(project: dict) -> Optional[str]:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 1000,
+        "max_tokens": 8000,
     }
 
     last_exc = None
