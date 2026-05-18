@@ -9,9 +9,6 @@ auto_responder.py
     - GET  /wants/{id}/check_offer_notify  — проверка перед откликом
     - POST /api/offer/createoffer          — создание отклика (FormData)
     - POST /api/offer/editoffer            — редактирование отклика
-
-Использование (CLI, dry-run):
-    python auto_responder.py --dry-run --project-id 1234567 --profile profile.json
 """
 
 import argparse
@@ -64,29 +61,39 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 
 _RESPONSE_SYSTEM_PROMPT = (
-    "Ты — фрилансер на Kwork. Ты просматриваешь проект и должен написать "
-    "короткий, убедительный отклик (предложение) заказчику и предложить цену.\n\n"
+    "Ты — фрилансер на Kwork. Напиши короткий отклик заказчику и предложи цену.\n\n"
+    "ЗАПРЕЩЕНО (самое важное):\n"
+    "- НЕ начинай с «Вижу...», «Вижу, вам нужно...», «Вижу, задача...»\n"
+    "- НЕ используй повелительное 1-е лицо: «сделаю», «запишу», «возьмусь», «напишу»\n"
+    "- НЕ пересказывай описание заказа — заказчик САМ его писал\n\n"
+    "СТРУКТУРА ОТКЛИКА (строго):\n"
+    "1. Покажи понимание задачи — одной фразой, простым языком, без «Вижу».\n"
+    "   Плохо: «Вижу, нужно настроить парсинг Wildberries...»\n"
+    "   Хорошо: «Парсинг Wildberries с фильтрацией - типовая задача, решается через Selenium и прокси»\n"
+    "2. Кратко про свой опыт в похожих задачах (1 предложение, без хвастовства).\n"
+    "3. Как планируешь решать — подход, инструменты (1-2 предложения).\n"
+    "4. Честный нюанс или риск, если есть.\n"
+    "5. Уточняющий вопрос, если нужно. Иначе - предложение обсудить детали.\n"
+    "Держись в рамках 3-5 предложений, пиши как живой человек.\n\n"
     "ПРАВИЛА РАСЧЁТА ЦЕНЫ:\n"
-    "- Проанализируй описание и оцени реальную сложность задачи\n"
-    "- Простая/быстрая задача (мелкий фикс, консультация, настройка) → снизь цену на 30-50% от бюджета\n"
-    "- Задача средней сложности (бот, лендинг, скрипт) → цена близка к бюджету (±10%)\n"
-    "- Сложная задача (полноценный сайт, интеграции, большой объём) → цена равна бюджету\n"
-    "- НИКОГДА не предлагай цену выше бюджета заказчика\n"
-    "- Цена должна быть целым числом в рублях\n\n"
+    "- Простая задача (фикс, консультация) → снизь на 30-50% от бюджета\n"
+    "- Средняя сложность (бот, лендинг, скрипт) → ±10% от бюджета\n"
+    "- Сложная задача (сайт, интеграции) → цена равна бюджету\n"
+    "- НИКОГДА не выше бюджета заказчика\n"
+    "- Цена — целое число в рублях\n\n"
     "ПРАВИЛА ТЕКСТА:\n"
-    "- Пиши на русском языке\n"
-    "- Длина: 3-7 предложений (максимум 800 символов)\n"
-    "- Начни с персонализированного обращения к задаче заказчика (покажи, что прочитал описание)\n"
-    "- Кратко опиши свой релевантный опыт\n"
-    "- Предложи конкретные сроки (если возможно оценить)\n"
-    "- Закончи вопросом или призывом к действию (например, предложи обсудить детали)\n"
-    "- НЕ используй шаблонные фразы вроде 'Здравствуйте, я фрилансер с опытом...'\n"
-    "- НЕ пересказывай всё описание заказа — покажи, что ты понял суть\n"
-    "- Будь конкретным и профессиональным\n\n"
+    "- Пиши простым, естественным языком — как живой человек в чате\n"
+    "- Без официоза, без канцеляризмов. Как коллега коллеге\n"
+    "- Длина: 3-5 предложений\n"
+    "- НЕ используй длинное тире «—», только короткое «-»\n"
+    "- НЕ упоминай цену и срок в тексте\n"
+    "- ЗАПРЕЩЕНЫ слова: «Вижу», «сделаю», «запишу», «возьмусь», «напишу», «настрою»\n"
+    "- НЕ используй: «Здравствуйте», «готов выполнить», «качественно, быстро»\n\n"
     "ФОРМАТ ОТВЕТА (строго):\n"
     "Цена: XXXX\n"
+    "Срок: X (дней/часов)\n"
     "\n"
-    "Текст отклика..."
+    "Текст отклика (без упоминания срока и цены — они уже указаны выше)"
 )
 
 # ---------------------------------------------------------------------------
@@ -159,15 +166,14 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
     price = project.get("price", "—")
     category = project.get("category", "")
 
+    profile_text = profile.get("text", "").strip()
+    if profile_text:
+        profile_block = f"Мой профиль фрилансера:\n{profile_text}\n\n"
+    else:
+        profile_block = ""
+
     user_prompt = (
-        f"Твой профиль на Kwork:\n"
-        f"- Имя: {profile.get('name', '')}\n"
-        f"- Специализация: {profile.get('specialization', '')}\n"
-        f"- Опыт: {profile.get('experience', '')}\n"
-        f"- Навыки: {profile.get('skills', '')}\n"
-        f"- Сильные стороны: {profile.get('strengths', '')}\n"
-        f"- Ставка: {profile.get('rate', '')}\n"
-        f"- Портфолио: {profile.get('portfolio', '')}\n\n"
+        f"{profile_block}"
         f"Проект на Kwork:\n"
         f"- Заголовок: {title}\n"
         f"- Категория: {category}\n"
@@ -182,8 +188,8 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
             {"role": "system", "content": _RESPONSE_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.7,
-        "max_tokens": 1000,
+        "temperature": 0.8,
+        "max_tokens": 2000,
     }
 
     logger.info("Генерирую текст отклика через %s...", AI_MODEL)
@@ -204,6 +210,7 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if content:
                     content = content.strip().strip('"').strip("'")
+                    content = content.replace('\u2014', '-').replace('\u2013', '-')
                     logger.info("Текст отклика сгенерирован (%d символов)", len(content))
                     return content
                 else:
@@ -216,17 +223,18 @@ async def generate_response_text(project: dict, profile: dict) -> Optional[str]:
     return None
 
 
-def parse_price_and_text(content: str, fallback_price: int) -> tuple[int, str]:
+def parse_response(content: str, fallback_price: int) -> tuple[int, str, str]:
     """
     Парсит ответ ИИ формата:
         Цена: XXXX
+        Срок: X (дней/часов)
 
         Текст отклика...
 
-    Возвращает (предложенная_цена, текст_отклика).
-    Если цену не удалось распарсить — используется fallback_price.
+    Возвращает (цена, срок, текст).
     """
     price = fallback_price
+    duration = "1 день"
     text = content
 
     price_match = re.match(r'Цена:\s*(\d+)', content)
@@ -237,11 +245,23 @@ def parse_price_and_text(content: str, fallback_price: int) -> tuple[int, str]:
                 price = parsed
         except ValueError:
             pass
-        text = content[price_match.end():].strip()
+        content = content[price_match.end():].strip()
 
+    dur_match = re.match(r'Срок:\s*(.+)', content)
+    if dur_match:
+        duration = dur_match.group(1).strip()
+        content = content[dur_match.end():].strip()
+
+    text = content
     if not text:
         text = content
 
+    return price, duration, text
+
+
+def parse_price_and_text(content: str, fallback_price: int) -> tuple[int, str]:
+    """Совместимость со старым API."""
+    price, _, text = parse_response(content, fallback_price)
     return price, text
 
 

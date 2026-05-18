@@ -202,7 +202,7 @@ async def run_parser(bot: Bot):
                                                 url=project["url"],
                                             ),
                                             InlineKeyboardButton(
-                                                text="🤖 Автоотклик",
+                                                text="⚡ Автоотклик",
                                                 callback_data=f"autorespond:{project['id']}",
                                             ),
                                         ]

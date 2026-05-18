@@ -188,19 +188,11 @@ async def set_auto_respond_enabled(user_id: int, enabled: bool) -> bool:
         return resp.status_code in (200, 204)
 
 
-async def set_user_profile(user_id: int, **fields) -> bool:
-    allowed = {
-        "profile_name", "profile_spec", "profile_exp",
-        "profile_skills", "profile_portfolio", "profile_strengths",
-        "profile_rate",
-    }
-    payload = {k: v for k, v in fields.items() if k in allowed and v is not None}
-    if not payload:
-        return False
+async def set_profile_text(user_id: int, text: str) -> bool:
     async with _client() as client:
         resp = await client.patch(
             f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
-            json=payload,
+            json={"profile_text": text},
             headers={"Prefer": "return=minimal"},
         )
         return resp.status_code in (200, 204)
