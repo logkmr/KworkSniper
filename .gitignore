@@ -163,3 +163,7 @@ cython_debug/
 # Temporary debug files
 debug.html
 research_*.html
+
+# Personal / runtime files
+kwork_cookies.txt
+sent_offers.json

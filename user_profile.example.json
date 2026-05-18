@@ -1,0 +1,10 @@
+{
+    "name": "Иван Петров",
+    "specialization": "Веб-разработчик, Python, Telegram-боты, парсинг данных",
+    "experience": "5 лет в веб-разработке, 3 года на Kwork, 50+ выполненных проектов",
+    "skills": "Python, JavaScript, TypeScript, React, Node.js, PostgreSQL, Docker, Linux, парсинг, Selenium, aiogram",
+    "portfolio": "https://github.com/username, https://kwork.ru/user/username",
+    "strengths": "Быстрое выполнение (1-2 дня), чистый код, подробная документация, всегда на связи в Telegram",
+    "rate": "2000 руб/час",
+    "kwork_link": "https://kwork.ru/user/username"
+}

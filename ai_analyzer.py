@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").rstrip("/")
 AI_TOKEN = os.getenv("AI_TOKEN", "")
-AI_MODEL = os.getenv("AI_MODEL", "gemini-3.1-flash-lite")
+AI_MODEL = os.getenv("AI_MODEL", "google/gemini-3.1-flash-lite")
 
 _SYSTEM_PROMPT = (
     "Ты — фрилансер на Kwork, специализация: веб-разработка, программирование, IT. "
@@ -92,6 +92,8 @@ async def get_rating(project: dict) -> Optional[str]:
                     headers={
                         "Authorization": f"Bearer {AI_TOKEN}",
                         "Content-Type": "application/json",
+                        "HTTP-Referer": "https://github.com/KworkSniper",
+                        "X-Title": "KworkSniper",
                     },
                     json=payload,
                 )
