@@ -1127,7 +1127,7 @@ async def cb_autosend(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Отправляю отклик...")
     await state.clear()
     success = await auto_responder.send_offer_with_cookies(
-        user.get("kwork_cookies") or "", project_id, auto["response_text"], auto["suggested_price"], _parse_days(duration))
+        user.get("kwork_cookies") or "", project_id, auto["response_text"], auto["suggested_price"], _parse_days(auto.get("duration", "1")))
     if success:
         _mark_offer_sent(user_id)
         await db.add_sent_offer_id(user_id, project_id)
