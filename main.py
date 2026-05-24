@@ -9,11 +9,13 @@ Dependencies:
 """
 
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 from aiogram import Bot, Dispatcher
@@ -24,13 +26,15 @@ from dotenv import load_dotenv
 import ai_analyzer
 import database as db
 import parser
-from telegram_bot import router, get_cached_filters, cache_projects
+from telegram_bot import router, get_cached_filters, cache_projects, set_runtime_stats
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID", "")
 POLL_INTERVAL = 20  # seconds between Kwork checks
 SEEN_MAXLEN = 1500  # сколько ID хранить в памяти (старые вытесняются)
+SEEN_IDS_PATH = Path(os.getenv("SEEN_IDS_PATH", "seen_projects.json"))
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +42,75 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def load_seen_ids() -> deque[str]:
+    try:
+        raw = json.loads(SEEN_IDS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            return deque((str(item) for item in raw[-SEEN_MAXLEN:]), maxlen=SEEN_MAXLEN)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("[Parser] Failed to load seen IDs: %s", exc)
+    return deque(maxlen=SEEN_MAXLEN)
+
+
+def save_seen_ids(seen_ids: deque[str]) -> None:
+    try:
+        SEEN_IDS_PATH.write_text(
+            json.dumps(list(seen_ids), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("[Parser] Failed to save seen IDs: %s", exc)
+
+
+def build_match_reason(project: dict, user: dict, ai_rating: str | None = None) -> str:
+    reasons = []
+
+    cat = project.get("category")
+    if cat and cat in parser.CATEGORIES:
+        reasons.append(f"категория: {parser.CATEGORIES[cat]['name']}")
+    elif not cat:
+        reasons.append("категория не распознана")
+
+    keywords = user.get("keywords", [])
+    if isinstance(keywords, str):
+        try:
+            keywords = json.loads(keywords)
+        except json.JSONDecodeError:
+            keywords = []
+    matched_keywords = [
+        kw for kw in keywords
+        if kw.lower() in (project.get("title", "") + " " + project.get("description", "")).lower()
+    ]
+    if matched_keywords:
+        reasons.append("ключевые слова: " + ", ".join(matched_keywords[:5]))
+
+    price_val = parser.extract_price_value(project.get("price", ""))
+    min_p = user.get("min_price")
+    max_p = user.get("max_price")
+    if price_val is not None and (min_p is not None or max_p is not None):
+        reasons.append(f"цена: {project.get('price')} ₽")
+
+    if ai_rating and user.get("ai_enabled"):
+        reasons.append(f"AI: {ai_rating}")
+
+    if not reasons:
+        reasons.append("подошёл по текущим фильтрам")
+
+    return "\n\n<b>Почему пришёл:</b> " + "; ".join(reasons)
+
+
+async def notify_error(bot: Bot, message: str) -> None:
+    if not ERROR_CHAT_ID:
+        return
+    try:
+        safe_message = html_lib.escape(message[:3500])
+        await bot.send_message(ERROR_CHAT_ID, f"<b>Kwork Sniper error</b>\n<code>{safe_message}</code>")
+    except Exception as exc:
+        logger.warning("[Bot] Failed to send error notification: %s", exc)
 
 
 def is_quiet_hour(now_hour: int, start: int | None, end: int | None) -> bool:
@@ -53,10 +126,10 @@ def is_quiet_hour(now_hour: int, start: int | None, end: int | None) -> bool:
 
 async def run_parser(bot: Bot):
     """Background task: polls Kwork and broadcasts new projects."""
-    seen_ids: deque[str] = deque(maxlen=SEEN_MAXLEN)
-    first_run = True
+    seen_ids = load_seen_ids()
+    first_run = not bool(seen_ids)
 
-    logger.info("[Parser] Starting...")
+    logger.info("[Parser] Starting... seen_ids=%d", len(seen_ids))
 
     async with httpx.AsyncClient(
         headers=parser.HEADERS, follow_redirects=True, timeout=30
@@ -76,14 +149,24 @@ async def run_parser(bot: Bot):
                     continue
 
                 cache_projects(projects)
+                set_runtime_stats(
+                    last_cycle_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    last_projects_count=len(projects),
+                    last_error=None,
+                )
 
                 new_projects = []
+                seen_changed = False
                 for p in projects:
                     if p["id"] in seen_ids:
                         continue
                     seen_ids.append(p["id"])
+                    seen_changed = True
                     if not first_run:
                         new_projects.append(p)
+
+                if seen_changed:
+                    save_seen_ids(seen_ids)
 
                 if not first_run and new_projects:
                     users = await db.get_subscribed_users()
@@ -169,29 +252,37 @@ async def run_parser(bot: Bot):
                             )
                             if ai_rating is None:
                                 logger.warning(
-                                    "[AI] Skip project %s — API error or limit",
+                                    "[AI] Rating unavailable for project %s",
                                     project["id"],
                                 )
-                                continue
 
                         base_text = parser.format_project_message(project)
                         for user in recipients:
                             text = base_text
-                            if user.get("ai_enabled") and ai_rating:
+                            if user.get("ai_enabled"):
                                 score = ai_analyzer.parse_score(ai_rating)
                                 min_score = user.get("ai_min_score")
+                                if min_score is not None and score is None:
+                                    logger.info(
+                                        "[AI] Skip user %s — score unavailable, min %s",
+                                        user["id"], min_score,
+                                    )
+                                    continue
                                 if min_score is not None and score is not None and score < min_score:
                                     logger.info(
                                         "[AI] Skip user %s — score %s < min %s",
                                         user["id"], score, min_score,
                                     )
                                     continue
-                                text += ai_analyzer.format_rating_line(ai_rating)
-                                logger.info(
-                                    "[AI] Added rating for user %s: %s",
-                                    user["id"],
-                                    ai_rating,
-                                )
+                                if ai_rating:
+                                    text += ai_analyzer.format_rating_line(ai_rating)
+                                    logger.info(
+                                        "[AI] Added rating for user %s: %s",
+                                        user["id"],
+                                        ai_rating,
+                                    )
+
+                            text += build_match_reason(project, user, ai_rating)
 
                             if user.get("auto_respond_enabled"):
                                 user_keyboard = InlineKeyboardMarkup(
@@ -202,7 +293,7 @@ async def run_parser(bot: Bot):
                                                 url=project["url"],
                                             ),
                                             InlineKeyboardButton(
-                                                text="⚡ Автоотклик",
+                                                text="⚡ Сгенерировать отклик",
                                                 callback_data=f"autorespond:{project['id']}",
                                             ),
                                         ]
@@ -239,9 +330,12 @@ async def run_parser(bot: Bot):
                     first_run = False
                 else:
                     logger.info("[Parser] Cycle complete, new: %d", len(new_projects))
+                set_runtime_stats(last_new_count=len(new_projects))
 
             except Exception as exc:
                 logger.exception("[Parser] Error: %s", exc)
+                set_runtime_stats(last_error=str(exc))
+                await notify_error(bot, str(exc))
 
             await asyncio.sleep(POLL_INTERVAL)
 

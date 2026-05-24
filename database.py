@@ -14,6 +14,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+_UNSET = object()
 
 
 def _client() -> httpx.AsyncClient:
@@ -83,6 +84,21 @@ async def get_subscribed_users() -> list[dict]:
         return []
 
 
+async def get_users_count() -> int:
+    async with _client() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/users?select=id",
+            headers={"Prefer": "count=exact"},
+        )
+        if resp.status_code == 200:
+            total = resp.headers.get("content-range", "0/0").split("/")[-1]
+            try:
+                return int(total)
+            except ValueError:
+                return len(resp.json())
+        return 0
+
+
 # ─── Filters ──────────────────────────────────────────────────
 
 async def get_user_filters(user_id: int) -> list[str]:
@@ -124,11 +140,11 @@ async def set_keywords(user_id: int, keywords: list[str]) -> bool:
         return resp.status_code in (200, 204)
 
 
-async def set_price_range(user_id: int, min_price: Optional[int], max_price: Optional[int]) -> bool:
+async def set_price_range(user_id: int, min_price=_UNSET, max_price=_UNSET) -> bool:
     payload = {}
-    if min_price is not None:
+    if min_price is not _UNSET:
         payload["min_price"] = min_price
-    if max_price is not None:
+    if max_price is not _UNSET:
         payload["max_price"] = max_price
     if not payload:
         return False
@@ -141,11 +157,11 @@ async def set_price_range(user_id: int, min_price: Optional[int], max_price: Opt
         return resp.status_code in (200, 204)
 
 
-async def set_quiet_hours(user_id: int, start: Optional[int], end: Optional[int]) -> bool:
+async def set_quiet_hours(user_id: int, start=_UNSET, end=_UNSET) -> bool:
     payload = {}
-    if start is not None:
+    if start is not _UNSET:
         payload["quiet_hours_start"] = start
-    if end is not None:
+    if end is not _UNSET:
         payload["quiet_hours_end"] = end
     async with _client() as client:
         resp = await client.patch(
@@ -183,57 +199,6 @@ async def set_auto_respond_enabled(user_id: int, enabled: bool) -> bool:
         resp = await client.patch(
             f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
             json={"auto_respond_enabled": enabled},
-            headers={"Prefer": "return=minimal"},
-        )
-        return resp.status_code in (200, 204)
-
-
-async def set_profile_text(user_id: int, text: str) -> bool:
-    async with _client() as client:
-        resp = await client.patch(
-            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
-            json={"profile_text": text},
-            headers={"Prefer": "return=minimal"},
-        )
-        return resp.status_code in (200, 204)
-
-
-async def set_user_cookies(user_id: int, cookies: str) -> bool:
-    async with _client() as client:
-        resp = await client.patch(
-            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
-            json={"kwork_cookies": cookies},
-            headers={"Prefer": "return=minimal"},
-        )
-        return resp.status_code in (200, 204)
-
-
-async def get_sent_offer_ids(user_id: int) -> list[str]:
-    user = await get_user(user_id)
-    if not user:
-        return []
-    raw = user.get("auto_respond_sent_ids")
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-    return []
-
-
-async def add_sent_offer_id(user_id: int, want_id: str) -> bool:
-    current = await get_sent_offer_ids(user_id)
-    if want_id in current:
-        return True
-    current.append(want_id)
-    async with _client() as client:
-        resp = await client.patch(
-            f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}",
-            json={"auto_respond_sent_ids": current},
             headers={"Prefer": "return=minimal"},
         )
         return resp.status_code in (200, 204)
